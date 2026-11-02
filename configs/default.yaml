@@ -1,0 +1,72 @@
+# Default configuration for Sepsis-ICU-Prediction.
+# Mirrors study_design.md. Any change here that changes the protocol needs
+# a dated entry in the decisions log in study_design.md.
+
+seed: 42
+
+task:
+  prediction_horizon_hours: 6        # H: sepsis within the next H hours
+  unit_of_analysis: patient_hour
+  unit_of_splitting: patient
+
+data:
+  development_dir: data/raw/training_setA   # Challenge 2019, hospital A
+  external_test_dir: data/raw/training_setB # hospital B: never used for tuning
+  patient_id_column: patient_id             # added when loading the .psv files
+  time_column: ICULOS
+  label_column: SepsisLabel
+
+labels:
+  # Hours between SepsisLabel turning 1 and clinical onset.
+  # VERIFY against the Challenge documentation, then log it in study_design.md.
+  label_shift_hours: 6
+  onset_verified: false              # set to true only after the check is logged
+  # Patients whose label is already 1 at their first row (left-censored onset).
+  exclude_left_censored_from_lead_time: true   # decide, then log
+
+splits:
+  method: grouped_kfold              # groups = patient
+  n_splits: 5
+  holdout_fraction: 0.2              # patient-level holdout from A, touched once at the end
+  holdout_seed: 42
+
+features:
+  imputation: forward_fill           # forward-fill only; no backward fill, no global means
+  rolling_windows_hours: [3, 6, 12]
+  # Report results with and without missingness indicators.
+  missingness_indicators: [true, false]
+
+alerting:
+  threshold_selection: fixed_alert_rate_on_development
+  target_alerts_per_patient_day: 1.0   # placeholder: choose BEFORE looking at results
+
+lead_time_bins:
+  early_min_hours: 12                # alert >= 12h before onset
+  intermediate_min_hours: 6          # 6 to <12h before onset; 0 to <6h is "late"
+  trajectory_window_hours: 24        # score trajectory before onset vs matched controls
+
+bootstrap:
+  n_resamples: 1000
+  resample_unit: patient
+  ci_level: 0.95
+
+calibration:
+  methods: [platt, isotonic]         # fit on development data only
+  levels: [hour, patient]
+  ece_bins: 10                       # secondary metric only
+  external_intercept_update:
+    labeled_fraction_of_hospital_b: 0.2   # fit on this part of B, evaluate on the rest
+
+baselines:
+  - icu_los_only                     # if this scores well, suspect time leakage
+  - sirs
+  - qsofa
+  - news2_style
+  - logistic_regression_latest_values
+  - gradient_boosting_rolling_windows   # main model
+
+subgroups: [age, sex, icu_unit, icu_stay_length, missing_data_amount]
+
+paths:
+  results_dir: results
+  error_cases_table: results/manual_error_review.csv
