@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sepsis-icu-prediction"
+version = "0.1.0"
+description = "Patient-level, leakage-controlled evaluation of ICU sepsis early warning on the PhysioNet/CinC Challenge 2019 data"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Tested with Python 3.12, numpy 2.4, pandas 3.0, scikit-learn 1.8, pyyaml 6.0.
+# The lower bounds below are the oldest versions expected to work; they have
+# not been tested. Raise them if you find otherwise.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+# Prints the data summary and onset checks: sepsis-icu-data --config configs/default.yaml
+sepsis-icu-data = "sepsis_icu.data:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
