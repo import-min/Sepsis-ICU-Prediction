@@ -36,6 +36,12 @@ Output layout (results_dir from the config, default "results"):
   final/holdout/, final/hospital_b/  results on the holdout and hospital B (only with --final)
   final/shift_holdout_vs_hospital_b.csv
   manual_error_review.csv            sample of error cases to review by hand (path from config)
+  report/                            analysis_counts.csv (patients and events in every analysis),
+                                     characteristics.csv, characteristics_shift_a_vs_b.csv (final only),
+                                     feature_inventory.csv (every feature each model used)
+  final/artifacts/models/            each fitted model (.joblib) with a .json file of its feature
+                                     columns, threshold and versions (load with reporting.load_model)
+  final/artifacts/calibrators/       fitted calibrators as JSON (reporting.load_calibrator)
   final_run.json                     written once by --final
 
 Each results folder holds: metrics.csv (with patient-level bootstrap CIs), thresholds, reliability.csv,
@@ -110,6 +116,14 @@ from sepsis_icu.recalibration import (
     PlattScaler,
     compare_calibration,
     split_labeled_portion,
+)
+from sepsis_icu.reporting import (
+    analysis_counts,
+    characteristics_shift,
+    characteristics_table,
+    feature_inventory,
+    save_calibrator,
+    save_model,
 )
 from sepsis_icu.splits import make_patient_split, rows_in, save_split
 
@@ -211,7 +225,8 @@ def model_specs(s: Settings) -> Dict[str, tuple]:
 def _write(table: pd.DataFrame, path: Path, files: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(path, index=False)
-    files.append(str(path))
+    if str(path) not in files:
+        files.append(str(path))
 
 
 def _prepare(df: pd.DataFrame, vcols: List[str], s: Settings):
@@ -333,18 +348,26 @@ def analyze_slice(
 
 # ---------- recalibration (final mode) ----------
 
-def _calibration_table(p_dev, y_dev, p_target, y_target, labeled, s: Settings, warnings: List[str], tag: str) -> pd.DataFrame:
+def _calibration_table(
+    p_dev, y_dev, p_target, y_target, labeled, s: Settings, warnings: List[str], tag: str, fitted: Optional[dict] = None
+) -> pd.DataFrame:
     """Compare uncalibrated and recalibrated predictions on the target. `labeled` is
-    (p, y) of the labeled portion of a new site, or None."""
+    (p, y) of the labeled portion of a new site, or None. Calibrators that could be fit are
+    added to `fitted` (variant name -> calibrator) if it is given."""
     variants = {"uncalibrated": p_target}
     for label, calibrator in (("platt_dev", PlattScaler()), ("isotonic_dev", IsotonicCalibrator())):
         try:
             variants[label] = calibrator.fit(p_dev, y_dev).transform(p_target)
+            if fitted is not None:
+                fitted[label] = calibrator
         except ValueError as err:
             warnings.append(f"{tag}: {label} skipped ({err})")
     if labeled is not None:
         try:
-            variants["intercept_update_labeled_b"] = InterceptShift().fit(*labeled).transform(p_target)
+            shift = InterceptShift().fit(*labeled)
+            variants["intercept_update_labeled_b"] = shift.transform(p_target)
+            if fitted is not None:
+                fitted["intercept_update_labeled_b"] = shift
         except ValueError as err:
             warnings.append(f"{tag}: intercept update skipped ({err})")
     return compare_calibration(y_target, variants, s.ece_bins)
@@ -374,7 +397,8 @@ def calibration_reports(
         in_labeled = np.isin(ids_t, labeled_ids)
         labeled_rows = (p_t[in_labeled], y_t[in_labeled])
         eval_rows = ~in_labeled
-    hour = _calibration_table(p_d, y_d, p_t[eval_rows], y_t[eval_rows], labeled_rows, s, warnings, f"{dataset}/{model}/hour")
+    fitted_hour: Dict[str, object] = {}
+    hour = _calibration_table(p_d, y_d, p_t[eval_rows], y_t[eval_rows], labeled_rows, s, warnings, f"{dataset}/{model}/hour", fitted_hour)
 
     ever_d, high_d = patient_level(ids_d, y_d, p_d)
     ever_t, high_t = patient_level(ids_t, y_t, p_t)
@@ -385,11 +409,12 @@ def calibration_reports(
         in_labeled = np.isin(unique_t, labeled_ids)
         labeled_pat = (high_t[in_labeled], ever_t[in_labeled])
         eval_pat = ~in_labeled
-    patient = _calibration_table(high_d, ever_d, high_t[eval_pat], ever_t[eval_pat], labeled_pat, s, warnings, f"{dataset}/{model}/patient")
+    fitted_patient: Dict[str, object] = {}
+    patient = _calibration_table(high_d, ever_d, high_t[eval_pat], ever_t[eval_pat], labeled_pat, s, warnings, f"{dataset}/{model}/patient", fitted_patient)
 
     hour.insert(0, "model", model)
     patient.insert(0, "model", model)
-    return {"hour": hour, "patient": patient}
+    return {"hour": hour, "patient": patient, "calibrators": {"hour": fitted_hour, "patient": fitted_patient}}
 
 
 # ---------- the run ----------
@@ -447,11 +472,16 @@ def run(
     holdout_mask = rows_in(pids, split.holdout_ids())
     dev_mask = ~holdout_mask
 
+    _write(analysis_counts(dev_df, y_a, split), out / "report" / "analysis_counts.csv", files)
+    patients_dev = patient_table(dev_df.loc[dev_mask], vcols)
+    _write(characteristics_table({"hospital_a_development": patients_dev}), out / "report" / "characteristics.csv", files)
+
     prob: Dict[str, bool] = {name: True for name in specs}
     prob.update({name: False for name in BASELINE_COLUMNS})
 
     log(f"cross-validating {len(specs)} models on the development patients ({s.n_splits} folds)")
     columns_for = {name: feature_columns(feats_a, kind=kind, include_missingness=inc) for name, (kind, inc, _) in specs.items()}
+    _write(feature_inventory(columns_for), out / "report" / "feature_inventory.csv", files)
     oof: Dict[str, np.ndarray] = {}
     for name, (kind, inc, factory) in specs.items():
         log(f"  {name}")
@@ -493,6 +523,28 @@ def run(
             X_a = feats_a[columns_for[name]].to_numpy(dtype=np.float32)
             X_b = feats_b[columns_for[name]].to_numpy(dtype=np.float32)
             model = factory().fit(X_a[dev_mask], y_a[dev_mask])
+            model_path, meta_path = save_model(
+                model,
+                str(out / "final" / "artifacts" / "models" / name),
+                metadata={
+                    "model": name,
+                    "feature_columns": columns_for[name],
+                    "feature_kind": kind,
+                    "missingness_indicators": inc,
+                    "threshold": thresholds[name],
+                    "target_alerts_per_patient_day": s.target_alerts_per_patient_day,
+                    "horizon_hours": s.horizon_hours,
+                    "label_shift_hours": s.label_shift_hours,
+                    "rolling_windows_hours": list(s.windows),
+                    "seed": s.seed,
+                    "trained_on": {
+                        "dataset": "hospital_a_development",
+                        "patients": int(len(split.development_ids())),
+                        "rows": int(dev_mask.sum()),
+                    },
+                },
+            )
+            files.extend([str(model_path), str(meta_path)])
             hold_scores[name] = model.predict_proba(X_a[holdout_mask])[:, 1]
             b_scores[name] = model.predict_proba(X_b)[:, 1]
         for name in BASELINE_COLUMNS:
@@ -501,6 +553,19 @@ def run(
 
         hold_df = dev_df.loc[holdout_mask].reset_index(drop=True)
         hold_y = y_a[holdout_mask]
+        patients_holdout = patient_table(hold_df, vcols)
+        patients_b = patient_table(ext_df, vcols)
+        _write(
+            characteristics_table(
+                {"hospital_a_development": patients_dev, "hospital_a_holdout": patients_holdout, "hospital_b": patients_b}
+            ),
+            out / "report" / "characteristics.csv", files,
+        )
+        _write(
+            characteristics_shift(patient_table(dev_df, vcols), patients_b),
+            out / "report" / "characteristics_shift_a_vs_b.csv", files,
+        )
+        _write(analysis_counts(dev_df, y_a, split, external=(ext_df, y_b)), out / "report" / "analysis_counts.csv", files)
         reviews = []
         for tag, sub_df, sub_y, sub_scores in (
             ("holdout", hold_df, hold_y, hold_scores),
@@ -528,6 +593,21 @@ def run(
                 )
                 hour_tables.append(rep["hour"])
                 patient_tables.append(rep["patient"])
+                # The development-fit calibrators are the same for both datasets, so save them once
+                # (from the holdout call). The intercept update only exists for hospital B.
+                for level, fitted in rep["calibrators"].items():
+                    for variant, calibrator in fitted.items():
+                        if (tag == "holdout") == (variant != "intercept_update_labeled_b"):
+                            path = save_calibrator(
+                                calibrator,
+                                str(out / "final" / "artifacts" / "calibrators" / f"{name}_{level}_{variant}.json"),
+                                metadata={
+                                    "model": name, "level": level, "variant": variant,
+                                    "fit_on": "labeled part of hospital_b" if variant == "intercept_update_labeled_b"
+                                    else "development out-of-fold predictions",
+                                },
+                            )
+                            files.append(str(path))
             _write(pd.concat(hour_tables, ignore_index=True), out / "final" / tag / "calibration_hour.csv", files)
             _write(pd.concat(patient_tables, ignore_index=True), out / "final" / tag / "calibration_patient.csv", files)
 
