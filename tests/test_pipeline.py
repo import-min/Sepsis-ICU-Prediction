@@ -25,6 +25,7 @@ import yaml
 pytest.importorskip("sklearn")
 
 from sepsis_icu.errors import REVIEW_COLUMNS
+from sepsis_icu.reporting import load_calibrator, load_model
 from sepsis_icu.pipeline import (
     BASELINE_COLUMNS,
     Settings,
@@ -248,6 +249,8 @@ def test_changing_hospital_b_does_not_change_development_results(world, dev_run,
     other = Path(run(other_world, results_dir=str(tmp_path / "out"), log=quiet)["results_dir"])
     for name in ("metrics.csv", "thresholds.csv", "lead_time_bins.csv", "utility.csv"):
         assert text(first / "dev" / name) == text(other / "dev" / name), name
+    for name in ("analysis_counts.csv", "characteristics.csv", "feature_inventory.csv"):
+        assert text(first / "report" / name) == text(other / "report" / name), name
 
 
 def test_changing_the_values_of_holdout_patients_does_not_change_development_results(world, dev_run, tmp_path):
@@ -367,6 +370,71 @@ def test_final_holdout_results_do_not_depend_on_hospital_b(final_run, tmp_path):
         assert text(out / "final" / "holdout" / name) == text(other / "final" / "holdout" / name), name
     # ... while hospital B's own results do change.
     assert text(out / "final" / "hospital_b" / "metrics.csv") != text(other / "final" / "hospital_b" / "metrics.csv")
+
+
+# ---------- report tables and saved files ----------
+
+def test_development_run_writes_report_tables_without_touching_hospital_b(dev_run):
+    out, _ = dev_run
+    counts = pd.read_csv(out / "report" / "analysis_counts.csv").set_index("analysis")
+    assert counts.loc["hospital_a_all", "patients"] == 120
+    assert counts.loc["hospital_a_development", "patients"] + counts.loc["hospital_a_holdout", "patients"] == 120
+    assert {"fold_0_training", "fold_2_validation"} <= set(counts.index)
+    assert "hospital_b" not in counts.index
+
+    characteristics = pd.read_csv(out / "report" / "characteristics.csv")
+    assert set(characteristics["dataset"]) == {"hospital_a_development"}
+    assert not (out / "report" / "characteristics_shift_a_vs_b.csv").exists()
+
+    inventory = pd.read_csv(out / "report" / "feature_inventory.csv")
+    assert set(inventory["model"]) == MODELS
+    flagged = inventory.groupby("model")["is_missingness_indicator"].any()
+    assert flagged["gradient_boosting_with_missingness"] and not flagged["gradient_boosting_without_missingness"]
+    assert not flagged["logistic_regression_latest"]
+    assert (inventory.loc[inventory["model"] == "logistic_regression_latest", "kind"] == "latest value").all()
+    assert not (out / "final").exists()   # nothing was saved from a final fit
+
+
+def test_final_run_writes_report_tables_for_every_dataset(final_run):
+    out, _ = final_run
+    counts = pd.read_csv(out / "report" / "analysis_counts.csv").set_index("analysis")
+    assert counts.loc["hospital_b", "patients"] == 70
+    characteristics = pd.read_csv(out / "report" / "characteristics.csv")
+    assert set(characteristics["dataset"]) == {"hospital_a_development", "hospital_a_holdout", "hospital_b"}
+    shift = pd.read_csv(out / "report" / "characteristics_shift_a_vs_b.csv")
+    assert {"hospital_a", "hospital_b", "standardized_difference"} <= set(shift.columns)
+    age = shift[shift["variable"] == "age"]
+    assert len(age) == 1
+
+
+def test_final_run_saves_every_fitted_model_with_its_details(final_run):
+    out, result = final_run
+    thresholds = pd.read_csv(out / "dev" / "thresholds.csv").set_index("model")["threshold"]
+    for name in MODELS:
+        model, metadata = load_model(str(out / "final" / "artifacts" / "models" / name))
+        assert metadata["model"] == name
+        assert len(metadata["feature_columns"]) == model.n_features_in_
+        assert metadata["threshold"] == pytest.approx(thresholds[name])
+        assert metadata["trained_on"]["dataset"] == "hospital_a_development"
+        assert metadata["trained_on"]["rows"] > 0 and metadata["seed"] == 7
+        probabilities = model.predict_proba(np.zeros((3, model.n_features_in_)))
+        assert probabilities.shape == (3, 2)
+    assert any(f.endswith("gradient_boosting_with_missingness.joblib") for f in result["files"])
+
+
+def test_final_run_saves_the_fitted_calibrators(final_run):
+    out, _ = final_run
+    folder = out / "final" / "artifacts" / "calibrators"
+    grid = np.linspace(0.01, 0.99, 25)
+    for name in MODELS:
+        for variant in ("platt_dev", "isotonic_dev", "intercept_update_labeled_b"):
+            path = folder / f"{name}_hour_{variant}.json"
+            assert path.exists(), path.name
+            calibrated = load_calibrator(str(path)).transform(grid)
+            assert ((calibrated >= 0) & (calibrated <= 1)).all()
+    # The development-fit calibrators are saved once; the intercept update comes from hospital B only.
+    assert len(list(folder.glob("*_intercept_update_labeled_b.json"))) <= 2 * len(MODELS)
+
 
 
 # ---------- settings and command line ----------
